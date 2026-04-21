@@ -94,13 +94,13 @@ impl AppState {
         override_protocol_version: Option<ProtocolVersion>,
         inline_tools_json: Option<&str>,
     ) -> Self {
-        // Priority: inline --tools JSON > URL-keyed on-disk cache > None. The
-        // on-disk cache always refreshes when the backend responds, so even
-        // when an inline seed is supplied, real backend data eventually takes
-        // over via `tools_cache` being replaced on the next live run.
-        let tools_cache = inline_tools_json
-            .and_then(cache::parse_inline)
-            .or_else(|| cache::load(&url));
+        // Priority: URL-keyed on-disk cache > inline --tools JSON > None. The
+        // on-disk cache is refreshed every time the backend responds, so it
+        // is always at least as fresh as the inline seed. `--tools` exists to
+        // bootstrap a URL that has never been reached (fresh worktree, new
+        // port, first run on a new machine), not to override observed tools.
+        let tools_cache = cache::load(&url)
+            .or_else(|| inline_tools_json.and_then(cache::parse_inline));
         Self {
             tools_cache,
             url,
