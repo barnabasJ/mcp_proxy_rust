@@ -7,19 +7,20 @@ use rmcp::{
 };
 use std::env;
 use tokio::io::{Stdin, Stdout};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::Duration;
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 // Modules
+mod cache;
 mod cli;
 mod core;
 mod state;
 
 use crate::cli::Args;
-use crate::core::{connect, flush_buffer_with_errors};
-use crate::state::{AppState, ProxyState}; // Only needed directly by main for final check
+use crate::core::flush_buffer_with_errors;
+use crate::state::{AppState, ProxyState};
 
 // Custom Error Codes (Keep here or move to common/state? Keeping here for now)
 const DISCONNECTED_ERROR_CODE: ErrorCode = ErrorCode(-32010);
@@ -55,50 +56,6 @@ type StdinCodec = rmcp::transport::async_rw::JsonRpcMessageCodec<ClientJsonRpcMe
 type StdoutCodec = rmcp::transport::async_rw::JsonRpcMessageCodec<ServerJsonRpcMessage>;
 type StdinStream = FramedRead<Stdin, StdinCodec>;
 type StdoutSink = FramedWrite<Stdout, StdoutCodec>;
-
-// --- Helper for Initial Connection ---
-const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
-
-/// Attempts to establish the initial SSE connection, retrying on failure.
-async fn connect_with_retry(app_state: &AppState, delay: Duration) -> Result<SseClientType> {
-    let start_time = Instant::now();
-    let mut attempts = 0;
-
-    loop {
-        attempts += 1;
-        info!(
-            "Attempting initial SSE connection (attempt {})...",
-            attempts
-        );
-
-        let result = connect(app_state).await;
-
-        // Try creating the transport
-        match result {
-            Ok(transport) => {
-                info!("Initial connection successful!");
-                return Ok(transport);
-            }
-            Err(e) => {
-                warn!("Attempt {} failed to start transport: {}", attempts, e);
-            }
-        }
-
-        if start_time.elapsed() >= INITIAL_CONNECT_TIMEOUT {
-            error!(
-                "Failed to connect after {} attempts over {:?}. Giving up.",
-                attempts, INITIAL_CONNECT_TIMEOUT
-            );
-            return Err(anyhow!(
-                "Initial connection timed out after {:?}",
-                INITIAL_CONNECT_TIMEOUT
-            ));
-        }
-
-        info!("Retrying in {:?}...", delay);
-        sleep(delay).await;
-    }
-}
 
 // --- Main Function ---
 #[tokio::main]
@@ -149,73 +106,108 @@ async fn main() -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel(10);
     let (timer_tx, mut timer_rx) = tokio::sync::mpsc::channel(10);
 
-    // Initialize application state
+    // Initialize application state. The proxy starts in `Connecting`, with
+    // no live transport — the stdio loop comes up immediately so Claude's
+    // `initialize` can be answered locally, and the backend connection is
+    // established in the background via the existing reconnect channel.
     let mut app_state = AppState::new(
         sse_url.clone(),
         args.max_disconnected_time,
         override_protocol_version,
+        args.tools.as_deref(),
     );
-    // Pass channel senders to state
     app_state.reconnect_tx = Some(reconnect_tx.clone());
     app_state.timer_tx = Some(timer_tx.clone());
+    app_state.state = ProxyState::Connecting;
+    app_state.transport_valid = false;
 
-    // Establish initial SSE connection using the retry helper
-    info!("Attempting initial connection to {}...", sse_url);
-    let mut transport =
-        connect_with_retry(&app_state, Duration::from_secs(args.initial_retry_interval)).await?;
-
-    info!("Connection established. Proxy operational.");
-    app_state.state = ProxyState::WaitingForClientInit;
+    let mut transport: Option<SseClientType> = None;
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut stdin_stream: StdinStream = FramedRead::new(stdin, StdinCodec::default());
     let mut stdout_sink: StdoutSink = FramedWrite::new(stdout, StdoutCodec::default());
 
-    info!("Connected to SSE endpoint, starting proxy");
+    // Kick off the initial backend-connection attempt immediately by firing
+    // the reconnect channel ourselves. The retry/backoff loop inside
+    // `handle_reconnect_signal` then handles every subsequent attempt.
+    info!("Scheduling initial connection to {}...", sse_url);
+    if let Err(e) = reconnect_tx.try_send(()) {
+        error!("Failed to schedule initial reconnect: {}", e);
+    }
 
-    // Set up heartbeat interval
+    // Grace window: if the backend is already up, give the initial connect
+    // a short head start over any incoming client traffic so that requests
+    // pass through live instead of being answered from the (possibly stale)
+    // offline cache. If the backend is down, we fall out of the grace window
+    // quickly and carry on in offline mode.
+    //
+    // The window is intentionally bounded — the whole point of going
+    // non-blocking was to let Claude's `initialize` handshake beat its
+    // timeout even when the backend is very slow or absent.
+    const INITIAL_GRACE: Duration = Duration::from_millis(1500);
+    let grace_deadline = tokio::time::Instant::now() + INITIAL_GRACE;
+    while transport.is_none() && tokio::time::Instant::now() < grace_deadline {
+        tokio::select! {
+            Some(_) = reconnect_rx.recv() => {
+                if let Some(new_transport) = app_state.handle_reconnect_signal(&mut stdout_sink).await? {
+                    transport = Some(new_transport);
+                }
+            }
+            _ = tokio::time::sleep_until(grace_deadline) => break,
+        }
+    }
+    if transport.is_some() {
+        debug!("Initial connection established within grace window.");
+    } else {
+        debug!("Initial connection did not complete within grace window; continuing in offline mode.");
+    }
+
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(1));
 
     // Main event loop
     loop {
         tokio::select! {
-            // Bias select towards checking cheaper/more frequent events first if needed,
-            // but default Tokio select is fair.
             biased;
-            // Handle message from stdin
+            // Messages from stdin
             msg = stdin_stream.next() => {
                 if !app_state.handle_stdin_message(msg, &mut transport, &mut stdout_sink).await? {
                     break;
                 }
             }
-            // Handle message from SSE server
-            result = transport.receive(), if app_state.transport_valid => {
-                if !app_state.handle_sse_message(result, &mut transport, &mut stdout_sink).await? {
+            // Messages from the SSE/streamable-http backend (only when a
+            // transport exists; `transport_valid` is false until connected).
+            result = async {
+                match transport.as_mut() {
+                    Some(t) => t.receive().await,
+                    None => std::future::pending().await,
+                }
+            }, if app_state.transport_valid && transport.is_some() => {
+                let Some(ref mut t) = transport else { unreachable!() };
+                if !app_state.handle_sse_message(result, t, &mut stdout_sink).await? {
                     break;
                 }
             }
-            // Handle reconnect signal
+            // Reconnect signal — fires for both the initial connect and every
+            // subsequent reconnect.
             Some(_) = reconnect_rx.recv() => {
-                // Call method on app_state
                 if let Some(new_transport) = app_state.handle_reconnect_signal(&mut stdout_sink).await? {
-                    transport = new_transport;
+                    transport = Some(new_transport);
                 }
-                // Check if disconnected too long *after* attempting reconnect
                 if app_state.disconnected_too_long() {
                     error!("Giving up after failed reconnection attempts and exceeding max disconnected time.");
-                    // Ensure buffer is flushed if not already done by handle_reconnect_signal
                     if !app_state.in_buf.is_empty() && app_state.buf_mode == state::BufferMode::Store {
                         flush_buffer_with_errors(&mut app_state, &mut stdout_sink).await?;
                     }
                     break;
                 }
             }
-            // Handle flush timer signal
             Some(_) = timer_rx.recv() => app_state.handle_timer_signal(&mut stdout_sink).await?,
-            // Handle heartbeat tick
-            _ = heartbeat_interval.tick() => app_state.handle_heartbeat_tick(&mut transport).await?,
-            // Exit if no events are ready (shouldn't happen with interval timers unless others close)
+            _ = heartbeat_interval.tick() => {
+                if let Some(ref mut t) = transport {
+                    app_state.handle_heartbeat_tick(t).await?;
+                }
+            }
             else => break,
         }
     }

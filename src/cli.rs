@@ -22,4 +22,14 @@ pub struct Args {
     #[arg(long)]
     /// Override the protocol version returned to the client
     pub override_protocol_version: Option<String>,
+
+    /// Inline JSON describing the tools the proxy should advertise before
+    /// the backend has connected. Accepts either a full `ListToolsResult`
+    /// (`{"tools":[...]}`) or a bare tools array (`[...]`). Intended for
+    /// inline use in MCP client configs such as `.mcp.json` — no separate
+    /// file needed. Takes precedence over the URL-keyed on-disk cache; the
+    /// on-disk cache is still refreshed whenever the backend returns a live
+    /// `tools/list` response.
+    #[arg(long, value_name = "JSON")]
+    pub tools: Option<String>,
 }

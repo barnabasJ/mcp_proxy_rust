@@ -163,7 +163,7 @@ pub(crate) async fn send_request_to_sse(
 pub(crate) async fn process_client_request(
     message: ClientJsonRpcMessage,
     app_state: &mut AppState,
-    transport: &mut SseClientType,
+    transport: &mut Option<SseClientType>,
     stdout_sink: &mut StdoutSink,
 ) -> Result<()> {
     // Try mapping the ID first (for Response/Error cases).
@@ -173,7 +173,10 @@ pub(crate) async fn process_client_request(
         None => return Ok(()), // Skip forwarding if ID was not mapped
     };
 
-    // Handle ping directly if disconnected
+    // Offline handling — covers both initial `Connecting` state (backend has
+    // never come up) and `Disconnected` state (backend died). Messages are
+    // answered locally where possible (initialize, ping, tools/list) and
+    // buffered otherwise.
     match app_state
         .maybe_handle_message_while_disconnected(message.clone(), stdout_sink)
         .await
@@ -181,6 +184,18 @@ pub(crate) async fn process_client_request(
         Err(_) => {}
         Ok(_) => return Ok(()),
     }
+
+    // Must be Some here — offline handling above consumes every path that
+    // leaves `transport` as None. Being defensive in case a future refactor
+    // adds a state that leaks through.
+    let Some(transport) = transport.as_mut() else {
+        error!(
+            "process_client_request reached the forwarding path without a live transport; \
+             dropping message: {:?}",
+            message
+        );
+        return Ok(());
+    };
 
     match &message {
         ClientJsonRpcMessage::Request(req) => {
@@ -319,7 +334,7 @@ pub(crate) async fn flush_buffer_with_errors(
 /// Returns Ok(false) if sending the init message failed (triggers disconnect).
 pub(crate) async fn initiate_post_reconnect_handshake(
     app_state: &mut AppState,
-    transport: &mut SseClientType,
+    transport: &mut Option<SseClientType>,
     stdout_sink: &mut StdoutSink,
 ) -> Result<bool> {
     if let Some(init_msg) = &app_state.init_message {

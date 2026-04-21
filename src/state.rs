@@ -1,3 +1,4 @@
+use crate::cache;
 use crate::core::{
     flush_buffer_with_errors, generate_id, initiate_post_reconnect_handshake,
     process_buffered_messages, process_client_request, reply_disconnected,
@@ -7,8 +8,10 @@ use crate::{SseClientType, StdoutSink};
 use anyhow::Result;
 use futures::SinkExt;
 use rmcp::model::{
-    ClientJsonRpcMessage, ClientNotification, ClientRequest, EmptyResult, InitializedNotification,
-    InitializedNotificationMethod, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerResult,
+    ClientJsonRpcMessage, ClientNotification, ClientRequest, EmptyResult, Implementation,
+    InitializeResult, InitializedNotification, InitializedNotificationMethod, ListToolsResult,
+    ProtocolVersion, RequestId, ServerCapabilities, ServerJsonRpcMessage, ServerResult,
+    ToolsCapability,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -77,6 +80,11 @@ pub struct AppState {
     pub transport_valid: bool,
     /// Time of last heartbeat check
     pub last_heartbeat: Instant,
+    /// Cached `tools/list` result, loaded from disk (or `--tools`) at startup
+    /// and refreshed whenever the backend returns a fresh `tools/list`
+    /// response. Used to answer client `tools/list` requests when the
+    /// backend is unreachable.
+    pub tools_cache: Option<ListToolsResult>,
 }
 
 impl AppState {
@@ -84,8 +92,17 @@ impl AppState {
         url: String,
         max_disconnected_time: Option<u64>,
         override_protocol_version: Option<ProtocolVersion>,
+        inline_tools_json: Option<&str>,
     ) -> Self {
+        // Priority: inline --tools JSON > URL-keyed on-disk cache > None. The
+        // on-disk cache always refreshes when the backend responds, so even
+        // when an inline seed is supplied, real backend data eventually takes
+        // over via `tools_cache` being replaced on the next live run.
+        let tools_cache = inline_tools_json
+            .and_then(cache::parse_inline)
+            .or_else(|| cache::load(&url));
         Self {
+            tools_cache,
             url,
             max_disconnected_time,
             override_protocol_version,
@@ -100,7 +117,7 @@ impl AppState {
             reconnect_tx: None,
             timer_tx: None,
             reconnect_scheduled: false,
-            transport_valid: true,
+            transport_valid: false,
             last_heartbeat: Instant::now(),
         }
     }
@@ -193,7 +210,7 @@ impl AppState {
         msg: Option<
             Result<ClientJsonRpcMessage, rmcp::transport::async_rw::JsonRpcMessageCodecError>,
         >,
-        transport: &mut SseClientType,
+        transport: &mut Option<SseClientType>,
         stdout_sink: &mut StdoutSink,
     ) -> Result<bool> {
         match msg {
@@ -300,6 +317,11 @@ impl AppState {
                     // --- End Initialization Response Handling ---
                 }
 
+                // Intercept `tools/list` responses on their way to the client
+                // so subsequent sessions can serve them from disk even when
+                // the backend isn't up yet.
+                self.maybe_cache_tools_result(&message);
+
                 // Forward the (potentially modified) message to stdout
                 // This now handles mapped server requests, mapped responses/errors, and notifications
                 debug!("Forwarding from SSE to stdout: {:?}", message);
@@ -323,31 +345,116 @@ impl AppState {
         message: ClientJsonRpcMessage,
         stdout_sink: &mut StdoutSink,
     ) -> Result<()> {
-        if self.state != ProxyState::Disconnected {
-            return Err(anyhow::anyhow!("Not disconnected"));
+        // "Offline" covers both `Connecting` (backend has never come up yet)
+        // and `Disconnected` (backend was up and died). Message handling is
+        // identical in both cases — respond to init/ping/tools.list locally
+        // and buffer everything else until the backend arrives.
+        if !matches!(
+            self.state,
+            ProxyState::Connecting | ProxyState::Disconnected
+        ) {
+            return Err(anyhow::anyhow!("Not offline"));
         }
 
-        // Handle ping directly if disconnected
-        if let ClientJsonRpcMessage::Request(ref req) = message {
-            if let ClientRequest::PingRequest(_) = &req.request {
-                debug!(
-                    "Received Ping request while disconnected, replying directly: {:?}",
-                    req.id
-                );
-                let response = ServerJsonRpcMessage::response(
-                    rmcp::model::ServerResult::EmptyResult(EmptyResult {}),
-                    req.id.clone(),
-                );
-                if let Err(e) = stdout_sink.send(response).await {
-                    error!("Error sending direct ping response to stdout: {}", e);
+        match message {
+            ClientJsonRpcMessage::Request(req) => match &req.request {
+                ClientRequest::PingRequest(_) => {
+                    debug!(
+                        "Received Ping request while offline, replying directly: {:?}",
+                        req.id
+                    );
+                    let response = ServerJsonRpcMessage::response(
+                        ServerResult::EmptyResult(EmptyResult {}),
+                        req.id.clone(),
+                    );
+                    if let Err(e) = stdout_sink.send(response).await {
+                        error!("Error sending direct ping response to stdout: {}", e);
+                    }
                 }
-                return Ok(());
+                ClientRequest::InitializeRequest(_) => {
+                    debug!(
+                        "Received Initialize while offline, replying locally: {:?}",
+                        req.id
+                    );
+                    // Remember the full init message so that when the backend
+                    // eventually connects, the hidden-init flow can replay it
+                    // (see `initiate_post_reconnect_handshake`).
+                    let stored = ClientJsonRpcMessage::Request(req.clone());
+                    if self.init_message.is_none() {
+                        self.init_message = Some(stored);
+                    }
+                    let response = local_initialize_response(
+                        req.id.clone(),
+                        &self.override_protocol_version,
+                    );
+                    if let Err(e) = stdout_sink.send(response).await {
+                        error!("Error sending local Initialize response: {}", e);
+                    }
+                    // Stay in `Connecting`/`Disconnected` — the client's
+                    // subsequent `initialized` notification and any tool
+                    // calls keep flowing through the offline path until the
+                    // backend transport becomes available.
+                }
+                ClientRequest::ListToolsRequest(_) => match self.tools_cache.clone() {
+                    Some(cached) => {
+                        debug!(
+                            "Serving tools/list from cache while offline: {:?} ({} tools)",
+                            req.id,
+                            cached.tools.len()
+                        );
+                        let response = ServerJsonRpcMessage::response(
+                            ServerResult::ListToolsResult(cached),
+                            req.id.clone(),
+                        );
+                        if let Err(e) = stdout_sink.send(response).await {
+                            error!("Error sending cached tools/list response: {}", e);
+                        }
+                    }
+                    None => {
+                        debug!(
+                            "Serving empty tools/list while offline (no cache): {:?}",
+                            req.id
+                        );
+                        let response = ServerJsonRpcMessage::response(
+                            ServerResult::ListToolsResult(ListToolsResult {
+                                tools: Vec::new(),
+                                next_cursor: None,
+                            }),
+                            req.id.clone(),
+                        );
+                        if let Err(e) = stdout_sink.send(response).await {
+                            error!("Error sending empty tools/list response: {}", e);
+                        }
+                    }
+                },
+                _ => {
+                    if self.buf_mode == BufferMode::Store {
+                        debug!("Buffering request for later retry");
+                        self.in_buf.push(ClientJsonRpcMessage::Request(req));
+                    } else {
+                        reply_disconnected(&req.id, stdout_sink).await?;
+                    }
+                }
+            },
+            ClientJsonRpcMessage::Notification(notif) => {
+                if matches!(
+                    notif.notification,
+                    ClientNotification::InitializedNotification(_)
+                ) {
+                    debug!(
+                        "Consumed initialized notification while offline; \
+                         will replay via hidden handshake when backend connects."
+                    );
+                } else if self.buf_mode == BufferMode::Store {
+                    debug!("Buffering notification for later retry");
+                    self.in_buf.push(ClientJsonRpcMessage::Notification(notif));
+                }
             }
-            if self.buf_mode == BufferMode::Store {
-                debug!("Buffering request for later retry");
-                self.in_buf.push(message);
-            } else {
-                reply_disconnected(&req.id, stdout_sink).await?;
+            other => {
+                if self.buf_mode == BufferMode::Store {
+                    debug!("Buffering client message for later retry");
+                    self.in_buf.push(other);
+                }
             }
         }
 
@@ -356,6 +463,8 @@ impl AppState {
 
     /// Handles the reconnect signal.
     /// Returns the potentially new transport if reconnection was successful.
+    /// Fires for both the initial connection and every subsequent reconnect
+    /// — so `Connecting` and `Disconnected` are both valid entry states.
     pub(crate) async fn handle_reconnect_signal(
         &mut self,
         stdout_sink: &mut StdoutSink,
@@ -363,52 +472,64 @@ impl AppState {
         debug!("Received reconnect signal");
         self.reconnect_scheduled = false;
 
-        if self.state == ProxyState::Disconnected {
-            match try_reconnect(self).await {
-                Ok(mut new_transport) => {
-                    self.transport_valid = true;
+        if !matches!(
+            self.state,
+            ProxyState::Connecting | ProxyState::Disconnected
+        ) {
+            return Ok(None);
+        }
 
-                    initiate_post_reconnect_handshake(self, &mut new_transport, stdout_sink)
+        match try_reconnect(self).await {
+            Ok(new_transport) => {
+                self.transport_valid = true;
+
+                // The handshake re-uses the client's stored init_message (if any).
+                // On initial connect with no client-init-yet, there's nothing to
+                // replay — the client's eventual `initialize` will flow through
+                // normally once the transport is set.
+                let mut transport_opt = Some(new_transport);
+                if self.init_message.is_some() {
+                    match initiate_post_reconnect_handshake(self, &mut transport_opt, stdout_sink)
                         .await
-                        .map(|success| {
-                            if success {
-                                Some(new_transport)
-                            } else {
-                                None // Handshake failed non-fatally, no new transport
-                            }
-                        })
-                }
-                Err(reason) => {
-                    self.connect_tries += 1;
-                    match reason {
-                        ReconnectFailureReason::TimeoutExceeded => {
-                            error!(
-                                "Reconnect attempt {} failed: Timeout exceeded",
-                                self.connect_tries
-                            );
-                            info!("Disconnected too long, flushing buffer.");
-                            flush_buffer_with_errors(self, stdout_sink).await?;
-                        }
-                        ReconnectFailureReason::ConnectionFailed(e) => {
-                            error!(
-                                "Reconnect attempt {} failed: Connection error: {}",
-                                self.connect_tries, e
-                            );
-                            if !self.disconnected_too_long() {
-                                self.schedule_reconnect();
-                            } else {
-                                info!(
-                                    "Disconnected too long after failed connect, flushing buffer."
-                                );
-                                flush_buffer_with_errors(self, stdout_sink).await?;
-                            }
-                        }
+                    {
+                        Ok(true) => Ok(transport_opt),
+                        Ok(false) => Ok(None),
+                        Err(e) => Err(e),
                     }
-                    Ok(None)
+                } else {
+                    // No client-init yet: skip the hidden handshake, just mark
+                    // transport ready. We'll transition through the normal
+                    // pass-through init path when the client sends `initialize`.
+                    self.state = ProxyState::WaitingForClientInit;
+                    Ok(transport_opt)
                 }
             }
-        } else {
-            Ok(None)
+            Err(reason) => {
+                self.connect_tries += 1;
+                match reason {
+                    ReconnectFailureReason::TimeoutExceeded => {
+                        error!(
+                            "Reconnect attempt {} failed: Timeout exceeded",
+                            self.connect_tries
+                        );
+                        info!("Disconnected too long, flushing buffer.");
+                        flush_buffer_with_errors(self, stdout_sink).await?;
+                    }
+                    ReconnectFailureReason::ConnectionFailed(e) => {
+                        error!(
+                            "Reconnect attempt {} failed: Connection error: {}",
+                            self.connect_tries, e
+                        );
+                        if !self.disconnected_too_long() {
+                            self.schedule_reconnect();
+                        } else {
+                            info!("Disconnected too long after failed connect, flushing buffer.");
+                            flush_buffer_with_errors(self, stdout_sink).await?;
+                        }
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -567,4 +688,61 @@ impl AppState {
             message
         }
     }
+
+    /// If the incoming server message is a `tools/list` response, save it to
+    /// disk so future sessions can answer the client before the backend is up.
+    pub(crate) fn maybe_cache_tools_result(&mut self, message: &ServerJsonRpcMessage) {
+        if let ServerJsonRpcMessage::Response(resp) = message
+            && let ServerResult::ListToolsResult(tools) = &resp.result
+        {
+            debug!(
+                "Caching tools/list response to disk ({} tools)",
+                tools.tools.len()
+            );
+            cache::save(&self.url, tools);
+            self.tools_cache = Some(tools.clone());
+        }
+    }
+}
+
+/// Build an `initialize` response the proxy can send without a live backend.
+///
+/// We advertise `tools.listChanged: true` so well-behaved clients know to
+/// refresh on the eventual `notifications/tools/list_changed` emission, even
+/// though Claude Code 2.1.x currently has a known bug where it doesn't honor
+/// it for late-discovered tools. The real load-bearing piece is the disk
+/// cache that backs subsequent `tools/list` calls.
+fn local_initialize_response(
+    id: RequestId,
+    override_protocol_version: &Option<ProtocolVersion>,
+) -> ServerJsonRpcMessage {
+    let protocol_version = override_protocol_version
+        .clone()
+        .unwrap_or(ProtocolVersion::V_2025_03_26);
+    let capabilities = ServerCapabilities {
+        tools: Some(ToolsCapability {
+            list_changed: Some(true),
+        }),
+        ..Default::default()
+    };
+    let server_info = Implementation {
+        name: "mcp-proxy-cached".into(),
+        title: None,
+        version: env!("CARGO_PKG_VERSION").into(),
+        icons: None,
+        website_url: None,
+    };
+    ServerJsonRpcMessage::response(
+        ServerResult::InitializeResult(InitializeResult {
+            protocol_version,
+            capabilities,
+            server_info,
+            instructions: Some(
+                "Proxy responding before backend has connected. \
+                 tools/list is served from disk cache; tool calls buffer until the backend is ready."
+                    .into(),
+            ),
+        }),
+        id,
+    )
 }
