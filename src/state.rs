@@ -26,6 +26,12 @@ pub enum ReconnectFailureReason {
     ConnectionFailed(anyhow::Error),
 }
 
+/// How many 20s windows the proxy waits before erroring out buffered
+/// requests on a backend that never came up. 3 × 20s ≈ 60s, which is
+/// usually enough to ride out a slow Phoenix boot without hanging the
+/// stdio client forever.
+pub const OFFLINE_FLUSH_RETRIES: u32 = 3;
+
 /// Buffer mode for message handling during disconnection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferMode {
@@ -70,6 +76,11 @@ pub struct AppState {
     pub buf_mode: BufferMode,
     /// Whether a flush timer is in progress
     pub flush_timer_active: bool,
+    /// How many times we've fired the offline flush timer without flushing.
+    /// After `OFFLINE_FLUSH_RETRIES` fires the buffered requests are errored
+    /// out — so a slow-booting backend gets several grace windows before
+    /// callers see a disconnected error.
+    pub offline_flush_retries: u32,
     /// Channel sender for reconnect events
     pub reconnect_tx: Option<Sender<()>>,
     /// Channel sender for timer events
@@ -114,6 +125,7 @@ impl AppState {
             in_buf: Vec::new(),
             buf_mode: BufferMode::Store,
             flush_timer_active: false,
+            offline_flush_retries: 0,
             reconnect_tx: None,
             timer_tx: None,
             reconnect_scheduled: false,
@@ -130,6 +142,9 @@ impl AppState {
         self.reconnect_scheduled = false;
         self.transport_valid = true;
         self.last_heartbeat = Instant::now();
+        // Fresh connection — subsequent offline windows should get the full
+        // retry quota again.
+        self.offline_flush_retries = 0;
     }
 
     pub fn disconnected(&mut self) {
@@ -431,6 +446,14 @@ impl AppState {
                     if self.buf_mode == BufferMode::Store {
                         debug!("Buffering request for later retry");
                         self.in_buf.push(ClientJsonRpcMessage::Request(req));
+                        // Bound per-call offline wait — otherwise requests
+                        // buffered before the backend ever came up (state is
+                        // still `Connecting`, not `Disconnected`, so
+                        // `handle_fatal_transport_error`'s flush-timer path
+                        // never fires) sit in the buffer indefinitely and
+                        // the stdio client hangs forever. `schedule_flush_timer`
+                        // is a no-op when the timer is already active.
+                        self.schedule_flush_timer();
                     } else {
                         reply_disconnected(&req.id, stdout_sink).await?;
                     }
@@ -448,12 +471,14 @@ impl AppState {
                 } else if self.buf_mode == BufferMode::Store {
                     debug!("Buffering notification for later retry");
                     self.in_buf.push(ClientJsonRpcMessage::Notification(notif));
+                    self.schedule_flush_timer();
                 }
             }
             other => {
                 if self.buf_mode == BufferMode::Store {
                     debug!("Buffering client message for later retry");
                     self.in_buf.push(other);
+                    self.schedule_flush_timer();
                 }
             }
         }
@@ -537,9 +562,33 @@ impl AppState {
     pub(crate) async fn handle_timer_signal(&mut self, stdout_sink: &mut StdoutSink) -> Result<()> {
         debug!("Received flush timer signal");
         self.flush_timer_active = false;
-        if self.state == ProxyState::Disconnected {
-            info!("Still disconnected after 20 seconds, flushing buffer with errors");
-            flush_buffer_with_errors(self, stdout_sink).await?;
+        // "Offline" covers both `Connecting` (backend has never come up) and
+        // `Disconnected` (backend died) — see `maybe_handle_message_while_disconnected`.
+        // Without the `Connecting` case, buffered requests made during the
+        // startup offline window would never time out.
+        if matches!(
+            self.state,
+            ProxyState::Connecting | ProxyState::Disconnected
+        ) {
+            if self.offline_flush_retries < OFFLINE_FLUSH_RETRIES {
+                self.offline_flush_retries += 1;
+                info!(
+                    "Still offline after 20 seconds, backend may be booting — waiting again (attempt {}/{})",
+                    self.offline_flush_retries, OFFLINE_FLUSH_RETRIES
+                );
+                self.schedule_flush_timer();
+            } else {
+                info!(
+                    "Still offline after {}×20s, flushing buffer with errors",
+                    OFFLINE_FLUSH_RETRIES + 1
+                );
+                self.offline_flush_retries = 0;
+                flush_buffer_with_errors(self, stdout_sink).await?;
+            }
+        } else {
+            // Back online — reset the retry counter so a future offline window
+            // starts from zero.
+            self.offline_flush_retries = 0;
         }
         Ok(())
     }
